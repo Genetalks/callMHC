@@ -1,0 +1,946 @@
+#!/usr/bin/perl -w
+use strict;
+use warnings;
+use Getopt::Long;
+use File::Basename qw(basename dirname);
+use FindBin qw($Bin $Script);
+use Data::Dumper;
+use Cwd;
+use Cwd 'abs_path';
+my $BEGIN_TIME=time();
+my $version="1.0.0";
+my @original_argv = @ARGV;
+#######################################################################################
+
+# ------------------------------------------------------------------
+# GetOptions
+# ------------------------------------------------------------------
+
+my $input_bam;
+my $reference;
+my $vcf;
+my $max_mnp_distance = 1;
+my $sample_name = "hg002";
+my $min_mapping_quality = 10;
+my $max_merge_dist = 1;
+my $region = "chr6:28510020-33480577";
+my $align_reads;  # aligned reads in bam format to rescue miscalled variants
+my $output_info;
+my $verbose;
+my $max_alternative_alleles = 2;
+my $min_allele_fraction = 0.4;
+
+GetOptions(
+				"help|?" =>\&USAGE,
+				"i:s"=>\$input_bam,
+				"o:s"=>\$vcf,
+				"R:s"=>\$reference,
+				"reads:s"=>\$align_reads,
+				"L:s"=>\$region,
+				"info"=>\$output_info,
+				"verbose"=>\$verbose,
+				"max-mnp-distance:i"=>\$max_mnp_distance,
+				"sample-name:s"=>\$sample_name,
+				"min-map-qual:i"=>\$min_mapping_quality,
+				"max-merge-dist:i"=>\$max_merge_dist,
+				"max-alt-alleles:i"=>\$max_alternative_alleles,
+				"maf:f"=>\$min_allele_fraction,
+				) or &USAGE;
+&USAGE unless ($input_bam && $vcf && $reference);
+
+unless (-f $input_bam) {
+    print STDERR "input BAM file dose not exist. path: $input_bam\n";
+    exit 1;
+}
+
+unless (-f $reference) {
+    print STDERR "input reference file dose not exist. path: $reference\n";
+    exit 1;
+}
+#==================================================================
+# global vars
+#==================================================================
+
+my $chr6_sequence;   # chr6 sequence
+my %haplotypes = (); # haplotype alignments
+my %pos_hap = (); # pos-haplotype relationship
+my %pos_vc = (); # raw vc parsed from haplotype alignments
+my @clusters = (); # vc cluster to be merged
+my %merged_vc = ();  # merged vc
+
+#==================================================================
+# main
+#==================================================================
+
+check_envs();
+
+# read_ref_seq
+print STDERR timestr()." load input data.\n";
+read_chr6_sequence($reference, \$chr6_sequence);
+
+# parse haplotype alignments
+parse_haplotype_alignments($input_bam, \%haplotypes, $region);
+
+
+# build event_map for all haplotypes
+print STDERR timestr()." build event map.\n";
+build_event_map(\%haplotypes, \%pos_vc, \$chr6_sequence, $max_mnp_distance, \%pos_hap);
+stat_variants(\%pos_vc) if (defined $verbose);
+
+# cluster adjacent variants
+print STDERR timestr()." cluster adjacent variants.\n";
+cluster_adjacent_variants(\%pos_vc, \@clusters, $max_merge_dist);
+# merge variants and genotyping
+print STDERR timestr()." merge variants and genotyping.\n";
+merge_variants_and_genotyping(\$chr6_sequence, \@clusters, \%merged_vc, \%pos_hap, \%haplotypes, 0.0, $max_alternative_alleles);
+# rescue variants in regions where assembly failed or mapping failed
+my %rescued_variants = ();
+my @hap_lt2_region = ();
+
+if (defined $align_reads && -f $align_reads){
+    print STDERR timestr()." rescue variants in poorly-assembled regions.\n";
+    rescue_incomplete_asm_regions($align_reads, $region, \%pos_hap, \@hap_lt2_region, \%rescued_variants, $min_allele_fraction, $max_alternative_alleles);
+    my $bedfile = $vcf;
+    $bedfile =~s/\.vcf$/\.hap_lt2.bed/g;
+    write_bed($bedfile, \@hap_lt2_region);
+}
+
+# merge two callset
+merge_callset(\%merged_vc, \%rescued_variants, \@hap_lt2_region);
+
+# output vcf file
+print STDERR timestr()." write vcf file.\n";
+write_vcf(\%merged_vc, $vcf, \$chr6_sequence, $region);
+
+#######################################################################################
+print STDOUT "\nDone. Total elapsed time : ",time()-$BEGIN_TIME,"s\n";
+#######################################################################################
+#==================================================================
+# subs
+#==================================================================
+
+sub merge_callset{
+    my ($vcs, $rvcs, $reg) = @_;
+    if (scalar(keys %{$rvcs}) == 0 or @$reg == 0){
+        return;
+    }
+    foreach my $r (@$reg){
+        foreach my $pos ($r->{start}..$r->{stop}){
+            if (defined $vcs->{$pos}){
+                delete $vcs->{$pos};
+            }
+        }
+    }
+    foreach my $pos (keys %{$rvcs}){
+        $vcs->{$pos} = $rvcs->{$pos};
+    }
+}
+
+sub rescue_incomplete_asm_regions{
+    my ($reads, $reg, $hc, $hap_lt2_reg, $rvc, $maf, $max_alt_allele) = @_;
+
+    my %long_reads =();
+    parse_haplotype_alignments($reads, \%long_reads, $reg);
+
+    # build event for region
+    my %pos_reads = ();
+    my %candidates = ();
+    build_event_map(\%long_reads, \%candidates, \$chr6_sequence, $max_mnp_distance, \%pos_reads);
+
+    # cluste adjacent variants
+    my @candidate_clusters = ();
+    cluster_adjacent_variants(\%candidates, \@candidate_clusters, $max_merge_dist);
+
+    # merge_variants and_genotyping
+    my %merged_candidates = ();
+    merge_variants_and_genotyping(\$chr6_sequence, \@candidate_clusters, \%merged_candidates, \%pos_reads, \%long_reads, $maf, $max_alt_allele);
+
+    # get regions covered by less than 2 haplotypes
+    get_hap_lt2_regions($hc, $reg, $hap_lt2_reg);
+
+    # filter
+    filter_variants_outside_rescued_regions(\%merged_candidates, $hap_lt2_reg, $rvc);
+}
+sub filter_variants_outside_rescued_regions{
+    my ($vcs, $target_reg, $rvc) = @_;
+    foreach my $reg (@$target_reg){
+        foreach my $pos ($reg->{start}..$reg->{stop}){
+            if (defined $vcs->{$pos}){
+                $rvc->{$pos} = $vcs->{$pos};
+            }
+        }
+    }
+}
+
+sub write_bed{
+    my ($ofile, $region) = @_;
+    open O, ">$ofile" or die $!;
+    foreach my $reg (@{$region}){
+        print O join("\t", $reg->{chr}, $reg->{start}, $reg->{stop}, $reg->{dep}), "\n";
+    }
+
+    close O;
+}
+
+sub get_hap_lt2_regions{
+    my $ph = shift;
+    my $mhc_reg = shift;
+    my $hap_lt2_reg = shift;
+
+    my ($chr, $reg_start, $reg_stop) = $mhc_reg =~/^(\S+):(\d+)-(\d+)$/;
+    unless (defined $chr && defined $reg_start && defined $reg_stop){
+        die "failed to parse reg_start and reg_stop from region string.\n";
+    }
+    if ($reg_start > $reg_stop){
+        die "region start > region stop.\n";
+    }
+    $reg_start -= 1;  # convert to 0-based
+
+    my @region_queue = ();
+    my $last_depth = -1;
+    foreach my $pos ($reg_start..$reg_stop){
+        my $depth = defined($ph->{$pos}) ? scalar(keys %{$ph->{$pos}}): 0;
+        if ($depth == $last_depth){
+            $region_queue[$#region_queue]->{stop} = $pos;
+        }else{
+            if (@region_queue != 0){
+                my $last = $region_queue[$#region_queue];
+                $last->{stop} = $pos - 1;
+                die "[ERROR] region_queue: region_start > region_stop" if ($last->{start} > $last->{stop});
+            }
+            push @region_queue, {chr=>$chr, start=>$pos, stop=>$pos, dep=>$depth};
+        }
+        $last_depth = $depth;
+    }
+    for (@region_queue){
+        if ($_->{dep} < 2){ # filter small hom-del regions
+            push @{$hap_lt2_reg}, $_ if ($_->{stop} - $_->{start} > 100);
+        }
+    }
+}
+sub cluster_adjacent_variants{
+    my ($pos_var, $vc_cluster, $max_merge_dist) = @_;
+
+    my $last_stop = -1;
+    foreach my $pos (sort {$a <=> $b} keys %$pos_var){
+        my $stop = -1;
+        foreach my $vc (@{$pos_var->{$pos}}){
+            if ($vc->{stop} > $stop){
+                $stop = $vc->{stop};
+            }
+        }
+        die "[ERROR] no variant at pos: $pos\n" if ($stop == -1);
+        if (@$vc_cluster == 0){
+            push @$vc_cluster, {
+                start => $pos,
+                stop => $stop,
+                vc => [@{$pos_var->{$pos}}],
+            };
+            $last_stop = $stop;
+        }else{
+            if ($pos - $last_stop <= $max_merge_dist){ # merge adjacent variant
+                my $last = $vc_cluster->[@$vc_cluster-1];
+                $last->{stop} = $stop if ($stop > $last->{stop});
+                push @{$last->{vc}}, @{$pos_var->{$pos}};
+                $last->{mixed} = 1;
+                $last_stop = $last->{stop};
+            }else{
+                push @$vc_cluster, {
+                    start => $pos,
+                    stop => $stop,
+                    vc => [@{$pos_var->{$pos}}],
+                };
+                $last_stop = $stop;
+            }
+        }
+    }
+}
+
+sub write_vcf {
+    my ($vcs, $vcf, $refseq, $mhc_reg) = @_;
+
+    my ($chr, $reg_start, $reg_stop) = $mhc_reg =~/^(\S+):(\d+)-(\d+)$/;
+    unless (defined $chr && defined $reg_start && defined $reg_stop){
+        die "failed to parse reg_start and reg_stop from region string.\n";
+    }
+    if ($reg_start > $reg_stop){
+        die "region start > region stop.\n";
+    }
+
+    my $header = make_vcf_header();
+
+    open O, ">$vcf" or die $!;
+    print O $header;
+    foreach my $pos (sort {$a <=> $b} keys %{$vcs}){
+        my $vc = $vcs->{$pos};
+        # filter vc not in MHC region
+        next if ($vc->{start}+1 < $reg_start || $vc->{start} >= $reg_stop);
+        next if ($vc->{filter} eq ".");
+        print O variant_to_string($vc), "\n";
+    }
+
+    close O;
+}
+
+sub make_vcf_header{
+    my $chr6_len = length($chr6_sequence);
+
+    my $header = "";
+    $header .= "##fileformat=VCFv4.2\n";
+    $header .= "##fileDate=".get_date()."\n";
+    $header .= "##source=$0 $version\n";
+    $header .= "##CL=".join(" ", $0, @original_argv)."\n";
+    $header .= "##contig=<ID=chr6,length=$chr6_len,assembly=hg38,species=\"Homo sapiens\">\n";
+    if (defined $output_info){
+        $header .= "##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count observed in haplotype set\">\n";
+        $header .= "##INFO=<ID=SH,Number=.,Type=String,Description=\"haplotypes support alternative alleles\">\n";
+    }
+    $header .= "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n";
+    $header .= join("\t",
+        "#CHROM",
+        "POS",
+        "ID",
+        "REF",
+        "ALT",
+        "QUAL",
+        "FILTER",
+        "INFO",
+        "FORMAT",
+        $sample_name,
+    )."\n";
+
+    return $header;
+}
+
+sub variant_to_string{
+    my $vc = shift;
+    return join("\t",
+        $vc->{chr},
+        $vc->{start}+1, # vcf pos is 1-based
+        ".",
+        $vc->{ref},
+        join(",", @{$vc->{alt}}),
+        ".",
+        $vc->{filter},
+        (defined $output_info) ? join(";",(map{$_."=".join(",", @{$vc->{info}->{$_}})} sort {$a cmp $b} keys %{$vc->{info}})) : ".",
+        "GT",
+        $vc->{GT},
+    );
+}
+
+sub simple_merge{
+    my ($vcs, $merged_vc, $hc) = @_;
+
+    my $ref_allele = determine_ref_bases($vcs->{vc});
+    # resolve alt
+    my %alt_allele_count = ();
+    my $alt_haps = 0;
+    my $pos = $vcs->{start};
+    foreach my $vc (@{$vcs->{vc}}){
+        die "[ERROR] Bug: try to merge variants at difference pos using simple merge strategy.\n" if ($vc->{start} != $pos);
+        if ($vc->{ref} ne $ref_allele){
+            my $extra_bases = substr($ref_allele, length($vc->{ref}));
+            $vc->{ref} = $ref_allele;
+            $vc->{stop} = $vc->{start} + length($ref_allele) - 1;
+            for(my $i = 0; $i < @{$vc->{alt}}; $i++){
+                $vc->{alt}->[$i] .= $extra_bases;
+            }
+        }
+        $alt_allele_count{$vc->{alt}->[0]}++;
+        $alt_haps++;
+    }
+    %{$merged_vc} = %{$vcs->{vc}->[0]};
+    delete $merged_vc->{hap};
+    $merged_vc->{alt} = [sort {$a cmp $b} keys %alt_allele_count];
+    $merged_vc->{info} = {
+        AC => [0, map {$alt_allele_count{$_}} @{$merged_vc->{alt}}],
+        SH => [keys %{$hc->{$merged_vc->{start}}}],
+    };
+    # calculate ref_count
+    if (defined $hc->{$merged_vc->{start}}){
+        my $d = $hc->{$merged_vc->{start}};
+        my $diff = scalar(keys %$d) - $alt_haps;
+        die "[ERROR] Bug: total haplotype depth < altnative haplotype depth.\n" if ($diff < 0);
+        $merged_vc->{info}->{AC}->[0] = $diff;
+    }
+}
+
+sub complex_merge{
+    my ($vcs, $merged_vc, $refseq, $hc, $haps) = @_;
+
+    die "[ERROR] Bug: try to merge simple variants using complex strategy.\n" unless (defined $vcs->{mixed});
+
+    # determin ref start and stop
+    my $ref_start = 300000000;
+    my $ref_stop = -1;
+    my %alt_hap = ();
+    foreach my $vc (@{$vcs->{vc}}){
+        if ($vc->{start} < $ref_start){
+            $ref_start = $vc->{start};
+        }
+        if ($vc->{stop} > $ref_stop){
+            $ref_stop = $vc->{stop};
+        }
+        $alt_hap{$vc->{hap}} = 1;
+    }
+    if ($ref_start > $ref_stop){
+        # TODO: this case is cause by cigar like 3D3I
+    }
+    my $ref_allele = substr($$refseq, $ref_start, $ref_stop-$ref_start+1);
+    # parse alt allele
+    my %alt_allele_count = ();
+    my $min_alt_allele_len = 5000000;
+    foreach my $hap_id (keys %alt_hap){
+        die "[ERROR] haplotype $hap_id: no such haplotype.\n" unless (defined $haps->{$hap_id});
+        my $alt_allele = parse_alt_allele_from_haplotype($haps->{$hap_id}, $ref_start, $ref_stop);
+        if ($alt_allele eq "" or $alt_allele eq $ref_allele) {
+            delete $alt_hap{$hap_id};
+            next;
+        }
+        $alt_allele_count{$alt_allele}++;
+        my $alt_len = length($alt_allele);
+        if ($alt_len < $min_alt_allele_len){
+            $min_alt_allele_len = $alt_len;
+        }
+    }
+    # left trim alleles(right shift)
+    my $shift_len = 0;
+    for (my $i = 0; $i < $ref_stop-$ref_start+1; $i++){
+        my $ref_base = substr($ref_allele, $i, 1);
+        my $right_shift = 1;
+        foreach my $alt (%alt_allele_count){
+            my $alt_base = substr($alt, $i, 1);
+            if ($alt_base ne $ref_base){
+                $right_shift = 0;
+                last;
+            }
+        }
+        if ($right_shift){
+            $shift_len++;
+        }else{
+            last;
+        }
+    }
+    if ($shift_len > 0 && $shift_len < $min_alt_allele_len){ # perform right shift
+        $ref_start += $shift_len;
+        $ref_allele = substr($ref_allele, $shift_len);
+        my %trimmed_alt = ();
+        foreach my $alt (keys %alt_allele_count){
+            $trimmed_alt{substr($alt, $shift_len)} = $alt_allele_count{$alt};;
+        }
+        %alt_allele_count = %trimmed_alt;
+    }
+    # construct merged vc
+    %{$merged_vc} = %{$vcs->{vc}->[0]};
+    $merged_vc->{start} = $ref_start;
+    $merged_vc->{stop} = $ref_stop;
+    $merged_vc->{ref} = $ref_allele;
+    $merged_vc->{alt} = [sort {$a cmp $b} keys %alt_allele_count];
+    # detect ref haplotype
+    my %all_hap = ();
+    my %ref_hap = ();
+    foreach my $pos ($ref_start..$ref_stop){
+        foreach my $hap_id(keys %{$hc->{$pos}}){
+            $all_hap{$hap_id} = 1;
+            if (not defined $alt_hap{$hap_id}){
+                $ref_hap{$hap_id} = 1;
+            }
+        }
+    }
+    $merged_vc->{info} = {
+        AC => [scalar(keys %ref_hap), map {$alt_allele_count{$_}} @{$merged_vc->{alt}}],
+        SH => [keys %all_hap],
+    };
+    $merged_vc->{mixed} = 1; # for debug
+}
+
+
+sub parse_alt_allele_from_haplotype{
+    my ($hap, $start, $stop) = @_;
+
+    my $cgr = $hap->{cgr};
+    my $alignment = \$hap->{'seq'};
+    my $ref_pos = $hap->{pos};
+    die "[ERROR] ref pos is negative.\n" if ($ref_pos < 0);
+    if ($start < $ref_pos){ # incomplete allele for merged var
+        return "";
+    }
+
+    my @ops = ();
+    my @ops_len = ();
+    while ($cgr=~/(\d+)([ISDMXNHP])/g){
+        push @ops_len, $1;
+        push @ops, $2;
+    }
+    my $alt = "";
+    my $alignment_pos = 0;
+    my $i = 0;
+    for ($i = 0; $i < @ops; $i++){
+
+        my $op = $ops[$i];
+        my $op_len = $ops_len[$i];
+        if ($op eq "I"){
+            if ($ref_pos >= $start && $ref_pos <= $stop+1){
+                $alt .= substr($$alignment, $alignment_pos, $op_len);
+            }
+            last if ($ref_pos > $stop);
+            $alignment_pos+= $op_len;
+        }elsif($op eq "S"){
+            $alignment_pos += $op_len;
+        }elsif($op eq "D"){
+            last if ($ref_pos > $stop);
+            $ref_pos += $op_len;
+        }elsif($op eq "M"  or $op eq "X"){
+            last if ($ref_pos > $stop);
+            if ($ref_pos + $op_len < $start){
+                $ref_pos += $op_len;
+                $alignment_pos += $op_len;
+                next;
+            }
+            my $s = $start - $ref_pos;
+            my $e = $stop - $ref_pos;
+            $s = 0 if ($s < 0);
+            #die "[ERROR] come across an incomplete haplotype, failed to parse alt allele. ref_pos: $ref_pos, start: $start, alt: $alt" if ($s < 0);
+            $e = $op_len-1 if ($e >= $op_len);
+            $alt .= substr($$alignment, $alignment_pos+$s, $e-$s+1);
+
+            $ref_pos += $op_len;
+            $alignment_pos += $op_len;
+            last if ($ref_pos > $stop+1);
+
+        }elsif($op eq "N" or $op eq "H" or $op eq "P"){
+        }else{
+            die "[ERROR] Unsupported cigar operator created. op: $op.\n";
+        }
+    }
+    #die "[ERROR] come across an incomplete haplotype, failed to parse alt allele." if ($ref_pos < $stop && $i == @ops);
+    #die "[ERROR] failed to extract alt allele from haplotype: $hap->{name}, chr6:$start-$stop.\n" if ($alt eq "");
+    if ($ref_pos < $stop && $i == @ops){
+        $alt = "";
+    }
+
+    return $alt;
+}
+
+
+sub merge_variants_and_genotyping {
+    my ($refseq, $vcs, $mv, $hc, $haps, $maf, $max_alt_allele) = @_;
+
+    foreach my $vcc (@$vcs){ # iterater vc cluster
+        my $merged_vc = {};
+        if (defined $vcc->{mixed}){ # complex variant
+            complex_merge($vcc, $merged_vc, $refseq, $hc, $haps);
+        }else{ # simple case
+            simple_merge($vcc, $merged_vc, $hc);
+        }
+
+        # genotyping
+        genotyping($merged_vc, $maf, $max_alt_allele);
+        $mv->{$merged_vc->{start}} = $merged_vc;
+    }
+}
+
+sub genotyping {
+    my ($vc, $maf, $max_alt_allele) = @_;
+
+    my $allele_count = $vc->{info}->{AC};
+    my $sum = 0;
+    foreach (@$allele_count){
+        $sum += $_;
+    }
+    #die "depth is zero.\n" if ($sum == 0);
+    if ($sum == 0){
+        # invalid merged vc is caused by cigar like: 3D3I
+        $vc->{GT} = "./.";
+        $vc->{filter} = ".";
+        return;
+    }
+    # filter allele by maf
+    my $nalleles = scalar(@$allele_count);
+    my @good_allele_idx = grep {$allele_count->[$_]/$sum > $maf} 1..($nalleles-1);
+    if (@good_allele_idx > $max_alt_allele){
+        $vc->{GT} = "./.";
+        $vc->{filter} = ".";
+        return;
+    }
+    $vc->{alt} = [map {$vc->{alt}->[$_-1]} @good_allele_idx];
+    $vc->{info}->{AC} = [$allele_count->[0], @{$allele_count}[@good_allele_idx]];
+    $allele_count = $vc->{info}->{AC};
+
+    my @hits_alleles = ();
+    for(my $i = 0; $i < @{$allele_count}; $i++){
+        if ($allele_count->[$i]/$sum > $maf){
+            push @hits_alleles, $i;
+        }
+    }
+    if (@hits_alleles == 1){
+        $vc->{GT} = "$hits_alleles[0]/$hits_alleles[0]";
+    }elsif(@hits_alleles == 2){
+        $vc->{GT} = "$hits_alleles[0]/$hits_alleles[1]";
+    }else{
+        print STDERR "[WARN] Too many alternative alleles, failed to genotyping variants: (chr6, $vc->{start}, $vc->{ref}, ", join(";", @{$vc->{alt}}), ").\n" if (defined $verbose);
+        $vc->{GT} = "./.";
+    }
+    if ($vc->{GT} ne "./." && $vc->{GT} ne "0/0"){
+        $vc->{filter} = "PASS";
+    }else{
+        $vc->{filter} = ".";
+    }
+}
+
+sub determine_ref_bases {
+    my $vcs = shift;
+    my $longest_ref_bases = "";
+    foreach (@$vcs){
+        if (length($_->{ref}) > length($longest_ref_bases)){
+            $longest_ref_bases = $_->{ref};
+        }
+    }
+    return $longest_ref_bases;
+}
+
+sub stat_variants{
+    my $pos_var = shift;
+
+    print STDERR "[INFO] total candidate variants: ", scalar(keys %{$pos_var}), "\n";
+    my %stat = ();
+    foreach my $pos (keys %{$pos_var}){
+        $stat{scalar(@{$pos_var->{$pos}})}++;
+    }
+    foreach my $hcount (sort {$a <=> $b} keys %stat){
+        print STDERR "[INFO] variants covered by $hcount haplotypes: ", $stat{$hcount}, "\n";
+    }
+}
+
+sub build_event_map{
+    my ($haps, $pos_var, $refseq, $max_mnp_dist, $hap_depth) = @_;
+
+    foreach my $hap (keys %$haps){
+        my $cgr = $haps->{$hap}->{cgr};
+        #next if ($cgr =~/.*\d+D\d+I.*/ || $cgr =~/.*\dI\d+D.*/);
+        my $evtmap = {haplotype=>$haps->{$hap}, ref=>$refseq, pos2var=>{}};
+        $haps->{$hap}->{'event_map'} = $evtmap;
+        process_cigar_for_initial_event($haps->{$hap}, $evtmap, $refseq, $max_mnp_dist, $hap_depth);
+        foreach my $pos (keys %{$evtmap->{pos2var}}){
+            push @{$pos_var->{$pos}}, $evtmap->{pos2var}->{$pos};
+        }
+    }
+}
+
+sub process_cigar_for_initial_event{
+    my ($hap, $emap, $refseq, $max_mnp_dist, $hap_depth) = @_;
+
+    my $cgr = $hap->{cgr};
+    my $alignment = \$hap->{'seq'};
+    my $ref_pos = $hap->{pos};
+
+    die "[ERROR] ref pos is negative.\n" if ($ref_pos < 0);
+
+    my @proposed_event = ();
+    my $alignment_pos = 0;
+
+    my @ops = ();
+    my @ops_len = ();
+    while ($cgr=~/(\d+)([ISDMXNHP])/g){
+        push @ops_len, $1;
+        push @ops, $2;
+    }
+
+    for (my $i = 0; $i < @ops; $i++){
+
+        my $op = $ops[$i];;
+        my $op_len = $ops_len[$i];
+        if ($op eq "I"){
+           if ($ref_pos > 0){
+               my @ialleles = ();
+               my $istart = $ref_pos - 1; # left aligned
+               my $ref_base = substr($$refseq, $istart, 1);
+               if ($ref_base =~/^[ACGT]$/){
+                   push @ialleles, $ref_base;
+               }
+               if ($i == 0 || $i == @ops-1){
+                   # if the insertion isn't completely resolved in the haplotype, skip it
+               }else{
+                    my $ibases = $ref_base.substr($$alignment, $alignment_pos, $op_len);
+                    if ($ibases =~/^[ACGT]+$/){
+                        push @ialleles, $ibases;
+                    }
+               }
+               if (@ialleles == 2){
+                   push @proposed_event, {chr=>"chr6", start=>$istart, stop=>$istart, ref=>$ref_base, alt=>[$ialleles[1]]};
+               }
+           }
+           $alignment_pos += $op_len;
+        }elsif($op eq "S"){
+            $alignment_pos += $op_len;
+        }elsif($op eq "D"){
+            if ($ref_pos > 0){
+                my $dstart = $ref_pos - 1;
+                my $dbases = substr($$refseq, $dstart, $op_len+1);
+                my @dalleles = ();
+                my $ref_base = substr($$refseq, $dstart, 1);
+                if ($ref_base=~/^[ACGT]$/ && $dbases=~/^[ACGT]+$/){
+
+                   push @proposed_event, {chr=>"chr6", start=>$dstart, stop=>$dstart+$op_len, ref=>$dbases, alt=>[$ref_base]};
+                }
+            }
+            $ref_pos += $op_len;
+        }elsif($op eq "M" or $op eq "X"){
+            my @mismatch_offsets = ();
+            for (my $offset = 0; $offset < $op_len; $offset++){
+                my $ref_base = substr($$refseq, $ref_pos+$offset, 1);
+                my $alt_base = substr($$alignment, $alignment_pos+$offset, 1);
+                if ($ref_base ne $alt_base && $ref_base=~/^[ACGT]$/ && $alt_base=~/^[ACGT]$/){
+                    push @mismatch_offsets, $offset;
+                }
+                $hap_depth->{$ref_pos+$offset}{$hap->{name}} = 1;
+            }
+            while (@mismatch_offsets != 0){
+                my $start = shift @mismatch_offsets;
+                my $end = $start;
+                while(@mismatch_offsets != 0 && $mismatch_offsets[0] - $end <= $max_mnp_dist){
+                    $end = shift @mismatch_offsets;
+                }
+                my $ref_bases = substr($$refseq, $ref_pos+$start, $end-$start+1);
+                my $alt_bases = substr($$alignment, $alignment_pos+$start, $end-$start+1);
+                push @proposed_event, {chr=>"chr6", start=>$ref_pos+$start, stop=>$ref_pos+$end, ref=>$ref_bases, alt=>[$alt_bases]};
+            }
+            $ref_pos += $op_len;
+            $alignment_pos += $op_len;
+
+        }elsif($op eq "N" or $op eq "H" or $op eq "P"){
+        }else{
+            die "[ERROR] Unsupported cigar operator created. op: $op.\n";
+        }
+    }
+
+    foreach my $vc (@proposed_event){
+        $vc->{hap} = $emap->{haplotype}->{name};
+        if (defined $emap->{pos2var}{$vc->{start}}){
+            my $prev = $emap->{pos2var}{$vc->{start}};
+            my $merge_vc = {};
+            my $failed_to_merge = make_block($prev, $vc, $merge_vc);
+            if ($failed_to_merge){
+                delete $emap->{pos2var}{$vc->{start}};
+                next;
+            }
+            if (@{$merge_vc->{alt}} > 0){
+                $emap->{pos2var}{$vc->{start}} = $merge_vc;
+            }
+        }else{
+            $emap->{'pos2var'}{$vc->{start}} = $vc;
+        }
+    }
+}
+
+sub make_block{
+    my ($vc1, $vc2, $merge_vc) = @_;
+    die "[ERROR] can not merge two vc with diff start pos.\n" if ($vc1->{start} != $vc2->{start});
+    die "[ERROR] vc1 must be biallelic.\n" unless (biallelic($vc1));
+
+    if (!is_snp($vc1)){
+        print STDERR "[ERROR] can not merge ins with del (or vice versa)." if ((is_simple_ins($vc1) && is_simple_del($vc2))||(is_simple_del($vc1) && is_simple_ins($vc2)));
+        return -1;
+    }else{
+        die "[ERROR] vc1 and vc2 are booth snps, which implies there's been some terrible bug in the cigar.\n" if (is_snp($vc2));
+    }
+
+    %{$merge_vc} = %{$vc1};
+    my $ref;
+    my $alt;
+    if (is_snp($vc1)){
+        if ($vc1->{ref} eq $vc2->{$ref}){
+            $ref = $vc1->{ref};
+            $alt = $vc1->{alt}->[0].substr($vc2->{alt}->[0], 1);
+        }else{
+            $ref = $vc2->{ref};
+            $alt = $vc1->{alt}->[0];
+            $merge_vc->{stop} = $vc2->{stop};
+        }
+    }else{
+        my $ins = is_simple_ins($vc1) ? $vc1 : $vc2;
+        my $del = is_simple_ins($vc1) ? $vc2 : $vc1;
+        $ref = $del->{ref};
+        $alt = $ins->{alt}->[0];
+        $merge_vc->{stop} = $del->{stop};
+    }
+    $merge_vc->{ref} = $ref;
+    $merge_vc->{alt} = [];
+    push @{$merge_vc->{alt}}, $alt if ($ref ne $alt);
+    return 0;
+}
+
+
+sub biallelic {
+    my $vc = shift;
+    return @{$vc->{alt}} == 1;
+}
+
+sub is_snp {
+    my $vc = shift;
+    return determine_type($vc) eq "Snp";
+}
+
+sub is_simple_ins {
+    my $vc = shift;
+    return is_simple_indel($vc) && length($vc->{ref}) == 1;
+}
+
+sub is_simple_del {
+    my $vc = shift;
+    return is_simple_indel($vc) && length($vc->{alt}->[0]) == 1;
+}
+
+sub is_simple_indel{
+    my $vc = shift;
+    return determine_type($vc) eq "Indel"
+           && biallelic($vc)
+           && length($vc->{ref}) > 0
+           && length($vc->{alt}->[0]) > 0
+           && substr($vc->{ref}, 0, 1) eq substr($vc->{alt}->[0], 0, 1)
+           && (length($vc->{ref}) == 1 || length($vc->{alt}->[0]) == 1);
+}
+
+sub determine_type {
+    my $vc = shift;
+    if (@{$vc->{alt}} == 0){
+        return "No_variation";
+    }
+    return determine_polymorphic_type($vc);
+}
+
+sub determine_polymorphic_type {
+    my $vc = shift;
+    my $type = "";
+    foreach my $alt (@{$vc->{alt}}){
+        my $biallelic_type = type_biallelic_variant(\$vc->{ref}, \$alt);
+        if ($type eq ""){
+            $type = $biallelic_type;
+        }elsif($biallelic_type ne $type){
+            $type = "Mixed";
+            last;
+        }
+    }
+    return $type;
+}
+
+sub type_biallelic_variant{
+    my ($ref, $alt) = @_;
+    my $rl = length($ref);
+    my $al = length($alt);
+    if ($rl == $al){
+        if ($rl == 1){
+            return "Snp";
+        }else{
+            return "Mnp";
+        }
+    }
+    return "Indel";
+}
+
+sub read_chr6_sequence {
+    my $chr6_fa = shift;
+    my $sequence = shift;
+    $$sequence = "";
+
+    $/=">";
+    open IN, "$chr6_fa" or die $!;
+    while(<IN>){
+        chomp;
+        next if (/^$/);
+        my ($id, @seqs) = split /\n/, $_;
+        next unless ($id =~/^chr6$/);
+        foreach my $s (@seqs) {
+            $$sequence .= $s;
+        }
+    }
+    close IN;
+    if ($$sequence eq ""){
+        die "[ERROR] parse chr6 sequence from file $chr6_fa failed.\n";
+    }
+}
+
+sub parse_haplotype_alignments {
+    my ($fbam, $hap, $target_reg) = @_;
+
+    $/="\n";
+    my $samtools = check_samtools();
+    open I, " $samtools view $fbam $target_reg |" or die $!;
+    while(<I>){
+        chomp;
+        next if (/^$/ or /^\@/);
+        my ($qname, $flag, $chr, $pos, $mq, $cgr, $mchr, $mpos, $isize, $seq, @others) = split /\s+/, $_;
+        next if (($flag&0x100) != 0); # filter sencondary mapping
+		next if (($flag&0x800) != 0 && $mq < $min_mapping_quality); # filter low quality supplementary alignments
+        my $key = $qname.'@'.$chr.':'.$pos;
+        $hap->{$key} = {name=>$key, pos=>$pos-1, mq=>$mq, cgr=>$cgr, seq=>$seq};
+    }
+    close I;
+}
+
+sub check_envs {
+    check_samtools();
+}
+
+sub check_samtools {
+    if (-f "$Bin/samtools"){
+        return "$Bin/samtools";
+    }
+    my $samtools = `which samtools`; chomp $samtools;
+    if ($samtools eq ""){
+        print STDERR "[ERROR] samtools not found, please install samtools at first.\n";
+        exit 1;
+    }
+    return $samtools;
+}
+
+sub run {
+    my $cmd = shift;
+
+    print STDERR "[ ".GetTime()." ] $cmd\n";
+    my $ret = system($cmd);
+    if ($ret){
+        print STDERR "[ERROR] execute cmd failed.\n";
+        exit 1;
+    }
+    print STDERR "[ ".GetTime()." ] CMD finished.\n";
+}
+sub get_date {
+    my ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst)=localtime(time());
+    return sprintf("%4d-%02d-%02d", $year+1900, $mon+1, $day);
+}
+sub timestr {
+    return "[ ".GetTime()." ]";
+}
+
+sub GetTime {
+    my ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst)=localtime(time());
+    return sprintf("%4d-%02d-%02d %02d:%02d:%02d", $year+1900, $mon+1, $day, $hour, $min, $sec);
+}
+
+sub USAGE {#
+	my $usage=<<"USAGE";
+Program: $0
+Version: $version
+
+Usage:
+  Options:
+  -i                <file>    input haplotype-to-ref bam file, required
+  -o                <file>    output vcf, required
+  -R                <file>    chr6 fasta, required
+  -reads            <file>    aligned reads in BAM format to rescue gap regions
+  -L                <str>     mhc region, default [$region]
+  -info                       output AC and SH to INFO
+  -sample-name      <str>     sample name, default [$sample_name]
+  -min-map-qual     <int>     min mapping quality to filter out supplementary alignments of haplotypes, default [$min_mapping_quality]
+  -max-mnp-distance <int>     max mnp distance, default [$max_mnp_distance]
+  -max-merge-dist   <int>     max distance of adjacent variants to be merged, [$max_merge_dist]
+  -max-alt-alleles  <int>     max alternative alleles, default [$max_alternative_alleles]
+  -maf              <float>   min alleles' fraction, default [$min_allele_fraction]
+  -verbose                    show warning messages during calling
+  -h                          help
+
+USAGE
+	print $usage;
+	exit;
+}

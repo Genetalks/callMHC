@@ -1,0 +1,15 @@
+[submodule "samtools"]
+	path = samtools
+	url = https://github.com/samtools/samtools.git
+[submodule "minimap2"]
+	path = minimap2
+	url = https://github.com/lh3/minimap2.git
+[submodule "hifiasm"]
+	path = hifiasm
+	url = https://github.com/chhylp123/hifiasm.git
+[submodule "gfatools"]
+	path = gfatools
+	url = https://github.com/lh3/gfatools.git
+[submodule "htslib"]
+	path = htslib
+	url = https://github.com/samtools/htslib.git

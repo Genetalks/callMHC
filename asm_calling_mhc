@@ -1,0 +1,289 @@
+#!/usr/bin/perl -w
+use strict;
+use warnings;
+use Getopt::Long;
+use FindBin qw($Bin $Script);
+use File::Basename qw(basename dirname);
+use Cwd;
+use Cwd 'abs_path';
+my $BEGIN_TIME=time();
+my $version="1.0.0";
+#######################################################################################
+
+# ------------------------------------------------------------------
+# GetOptions
+# ------------------------------------------------------------------
+
+my $input_bam;
+my $mhc_region = "chr6:28510020-33480577";
+my $outdir;
+my $prefix;
+my $reference;
+my $sample_name;
+my $min_allele_fraction = 0.4;
+my $max_alternative_alleles = 2;
+
+GetOptions(
+				"help|?" =>\&USAGE,
+				"i:s"=>\$input_bam,
+				"o:s"=>\$outdir,
+				"p:s"=>\$prefix,
+				"R:s"=>\$reference,
+				"L:s"=>\$mhc_region,
+				"s:s"=>\$sample_name,
+				"maf:f"=>\$min_allele_fraction,
+				"max-alt-alleles:i"=>\$max_alternative_alleles,
+				) or &USAGE;
+&USAGE unless ($input_bam && $outdir && $reference);
+
+mkdir $outdir unless (-d $outdir) ;
+$outdir = Cwd::abs_path($outdir);
+
+unless (-f $input_bam) {
+    print STDERR "input BAM file dose not exist. path: $input_bam\n";
+    exit 1;
+}
+
+unless (-f $reference) {
+    print STDERR "input reference file dose not exist. path: $reference\n";
+}
+
+unless (defined $prefix){
+    $prefix = basename $input_bam;
+    $prefix =~s/\.bam$//;
+}
+$prefix = "$outdir/$prefix";
+
+#==================================================================
+# main
+#==================================================================
+
+check_envs();
+
+# 1. extract hifi reads mapped to mhc region and  convert to fastq
+my $sample = "";
+my $mhc_fq = extract_mhc_reads($input_bam, $prefix, $mhc_region, \$sample);
+$sample = $sample_name if (defined $sample_name); # sample name in BAM file is not correct
+
+# 2. asm hifi reads in mhc region and get haplotypes
+
+my $utg_fa = asm_mhc($mhc_fq);
+
+# 3. remap the haplotype to chromsome 6
+
+my $haplotype_alignments = remap_haplotypes($utg_fa, $reference);
+
+# 4. build event and call variants
+call_mhc($input_bam, $haplotype_alignments, $prefix, $sample, $mhc_region, $min_allele_fraction, $max_alternative_alleles);
+
+
+#######################################################################################
+print STDOUT "\nDone. Total elapsed time : ",time()-$BEGIN_TIME,"s\n";
+#######################################################################################
+#==================================================================
+# subs
+#==================================================================
+
+sub check_envs {
+    check_samtools();
+    check_hifiasm();
+    check_gfatools();
+    check_minimap2();
+}
+
+sub call_mhc {
+    my ($align_reads, $halign, $fprefix, $sample, $region, $maf, $max_alt_alleles) = @_;
+
+    # get chr6 ref
+    my $ref = dirname($halign)."/chr6.fa";
+    unless (-f $ref) {
+        die "[ERROR] chr6 fasta file dose not exist.\n";
+    }
+    my $o_vcf = "$fprefix.vcf";
+
+    my $cmd = "perl $Bin/build_event_and_call -i $halign -reads $align_reads -o $o_vcf -R $ref -sample-name $sample -l $region -maf $maf -max-alt-alleles $max_alt_alleles";
+    run($cmd);
+}
+
+sub remap_haplotypes {
+    my $haplotypes = shift;
+    my $ref = shift;
+
+    # extract chr6 ref sequence
+    my $samtools = check_samtools();
+    my $chr6 = dirname($haplotypes)."/chr6.fa";
+    my $cmd = "$samtools faidx $ref chr6 > $chr6";
+    run($cmd);
+
+    # map haplotypes to chr6
+    my $minimap2 = check_minimap2();
+    my $ncpus = ncpus();
+    my $o_bam = $haplotypes;
+    $o_bam =~s/\.fa$/\.bam/g;
+
+    $cmd = "$minimap2 -t $ncpus -ax asm10 $chr6 $haplotypes|$samtools view -@ 4 -bS -|$samtools sort -@ 4 -o $o_bam - && $samtools index -@ $ncpus $o_bam";
+    run($cmd);
+    die "[ERROR] $o_bam dose not exist. remap haplotypes may be failed.\n" unless (-f $o_bam);
+
+    return $o_bam;
+}
+
+sub check_minimap2 {
+    if (-f "$Bin/minimap2/minimap2"){
+        return "$Bin/minimap2/minimap2";
+    }
+    my $minimap2 = `which minimap2`; chomp $minimap2;
+    if ($minimap2 eq ""){
+        print STDERR "[ERROR] minimap2 not found, please install minimap2 at first.\n";
+        exit 1;
+    }
+    return $minimap2;
+}
+
+sub asm_mhc {
+    my $fq = shift;
+
+    my $hifiasm = check_hifiasm();
+
+    my $fprefix = $fq;
+    $fprefix =~s/\.fq$/\.hifiasm/g;
+
+    my $ncpus = ncpus();
+    my $cmd = "$hifiasm -o $fprefix -t $ncpus $fq";
+    run($cmd);
+
+    # check result
+    my $utg_gfa = "$fprefix.r_utg.gfa";
+    die "[ERROR] $utg_gfa dose not exist, please check hifiasm results.\n" unless (-f $utg_gfa);
+
+    # plot assembly graph
+    $cmd = "$Bin/Bandage image $utg_gfa $utg_gfa.svg";
+    run($cmd);
+
+    # extract haplotype from gfa
+    my $utg_fa = $utg_gfa;
+    $utg_fa =~s/\.gfa/\.fa/g;
+    my $gfatools = check_gfatools();
+    $cmd = "$gfatools gfa2fa $utg_gfa > $utg_fa";
+    run($cmd);
+    die "[ERROR] could not extract haplotype from unitig gfa\n" unless (-f $utg_fa);
+
+    return $utg_fa;
+}
+
+sub check_gfatools {
+    if (-f "$Bin/gfatools/gfatools"){
+        return "$Bin/gfatools/gfatools";
+    }
+    my $gfatools = `which gfatools`; chomp $gfatools;
+    if ($gfatools eq ""){
+        print STDERR "[ERROR] gfatools not found, please install gfatools at first.\n";
+        exit 1;
+    }
+    return $gfatools;
+}
+
+sub ncpus {
+    my $ncpus = `getconf _NPROCESSORS_ONLN`; chomp $ncpus;
+    $ncpus = 8 unless (defined $ncpus);
+    return $ncpus;
+}
+
+sub check_hifiasm {
+    if (-f "$Bin/hifiasm/hifiasm"){
+        return "$Bin/hifiasm/hifiasm";
+    }
+    my $hifiasm = `which hifiasm`; chomp $hifiasm;
+    if ($hifiasm eq ""){
+        print STDERR "[ERROR] hifiasm not found, please install hifiasm at first.\n";
+        exit 1;
+    }
+    return $hifiasm;
+}
+
+sub extract_mhc_reads{
+    my $bam = shift;
+    my $fprefix = shift;
+    my $reg = shift;
+    my $sample_name = shift;
+
+    my $ofile = "$fprefix.mhc.fq";
+    if (-f $ofile){
+        print STDERR "[ERROR] fastq file already exists: $ofile\n";
+        exit 1;
+    }
+    open O, ">$ofile" or die $!;
+    my $samtools = check_samtools();
+    open I, "$samtools view -h $bam $reg|" or die $!;
+    while (<I>){
+        chomp;
+        next if (/^$/);
+        if (/^\@/){
+            if (/^\@RG/){
+                ($$sample_name) = $_ =~/^\@RG.*SM:(\S+).*$/;
+            }
+            next;
+        }
+        my @cols = split /\s+/, $_;
+        print O join("\n", '@'.$cols[0], $cols[9], "+", $cols[10]), "\n";
+    }
+
+    close I;
+    close O;
+
+    die "[ERROR] failed to parse sample name from bam file.\n" if ((not defined $$sample_name) or $$sample_name eq "");
+
+    return $ofile;
+}
+
+sub check_samtools {
+    if (-f "$Bin/samtools/samtools"){
+        return "$Bin/samtools/samtools";
+    }
+    my $samtools = `which samtools`; chomp $samtools;
+    if ($samtools eq ""){
+        print STDERR "[ERROR] samtools not found, please install samtools at first.\n";
+        exit 1;
+    }
+    return $samtools;
+}
+
+sub run {
+    my $cmd = shift;
+
+    print STDERR "[ ".GetTime()." ] $cmd\n";
+    my $ret = system($cmd);
+    if ($ret){
+        print STDERR "[ERROR] execute cmd failed.\n";
+        exit 1;
+    }
+    print STDERR "[ ".GetTime()." ] CMD finished.\n";
+}
+
+sub GetTime {
+        my ($sec, $min, $hour, $day, $mon, $year, $wday, $yday, $isdst)=localtime(time());
+        return sprintf("%4d-%02d-%02d %02d:%02d:%02d", $year+1900, $mon+1, $day, $hour, $min, $sec);
+}
+
+sub USAGE {#
+	my $usage=<<"USAGE";
+Program: $0
+Version: $version
+
+Usage:
+  Options:
+  -i     <file>   input bam file, required
+  -o     <dir>    output directory
+  -p     <str>    output file prefix, required
+  -R     <file>   reference fasta file, required
+  -L     <str>    MHC region, default [$mhc_region]
+  -s     <str>    sample name
+  -maf   <float>  min alleles' fraction, default [$min_allele_fraction]
+  -max-alt-alleles
+         <int>    max alternative alleles, default [$max_alternative_alleles]
+  -h              help
+
+USAGE
+	print $usage;
+	exit;
+}
