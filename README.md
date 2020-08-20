@@ -1,11 +1,7 @@
 # Install
 ```shell
-git clone https://github.com/Genetalks/precisionFDA.git
-cd precisionFDA
-git checkout asm_call_MHC
-git submodule init
-git submodule update
-make -C asm
+git clone https://github.com/Genetalks/callMHC.git
+make -C callMHC
 ```
 
 # Usage:
